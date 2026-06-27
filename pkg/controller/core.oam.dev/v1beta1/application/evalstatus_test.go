@@ -181,3 +181,68 @@ func Test_applyComponentHealthToServices(t *testing.T) {
 		})
 	}
 }
+
+func TestFilterRemovedComponentsFromStatus(t *testing.T) {
+	tests := []struct {
+		name             string
+		components       []common.ApplicationComponent
+		statusServices   []common.ApplicationComponentStatus
+		expectedServices []string
+		servicesRemoved  bool
+	}{
+		{
+			name: "removed component is filtered from services",
+			components: []common.ApplicationComponent{
+				{Name: "backend", Type: "webservice"},
+			},
+			statusServices: []common.ApplicationComponentStatus{
+				{Name: "frontend", Namespace: "default"},
+				{Name: "backend", Namespace: "default"},
+			},
+			expectedServices: []string{"backend"},
+			servicesRemoved:  true,
+		},
+		{
+			name:       "all components removed results in empty services",
+			components: []common.ApplicationComponent{},
+			statusServices: []common.ApplicationComponentStatus{
+				{Name: "frontend", Namespace: "default"},
+				{Name: "backend", Namespace: "default"},
+			},
+			expectedServices: []string{},
+			servicesRemoved:  true,
+		},
+		{
+			name: "no components removed keeps all services",
+			components: []common.ApplicationComponent{
+				{Name: "frontend", Type: "webservice"},
+				{Name: "backend", Type: "webservice"},
+			},
+			statusServices: []common.ApplicationComponentStatus{
+				{Name: "frontend", Namespace: "default"},
+				{Name: "backend", Namespace: "default"},
+			},
+			expectedServices: []string{"frontend", "backend"},
+			servicesRemoved:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			filteredServices, servicesRemoved := filterRemovedComponentsFromStatus(
+				tt.components,
+				tt.statusServices,
+			)
+
+			assert.Equal(t, tt.servicesRemoved, servicesRemoved,
+				"servicesRemoved flag should match expected value")
+
+			assert.Equal(t, len(tt.expectedServices), len(filteredServices),
+				"filtered services count should match expected")
+			for i, expectedName := range tt.expectedServices {
+				assert.Equal(t, expectedName, filteredServices[i].Name,
+					fmt.Sprintf("service at index %d should be %s", i, expectedName))
+			}
+		})
+	}
+}

@@ -75,6 +75,10 @@ const (
 const (
 	// baseWorkflowBackoffWaitTime is the time to wait gc check
 	baseGCBackoffWaitTime = 3000 * time.Millisecond
+
+	// minPerAppResyncPeriod is the minimum reconciliation interval that can be
+	// set via the per-application annotation to prevent excessive API server load.
+	minPerAppResyncPeriod = 10 * time.Second
 )
 
 var (
@@ -142,6 +146,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if err != nil {
 		return r.endWithNegativeCondition(logCtx, app, condition.ReconcileError(err), common.ApplicationStarting)
 	}
+
+	// Handle workflow restart requests - converts annotation to status field
+	r.handleWorkflowRestartAnnotation(ctx, app)
+
 	endReconcile, result, err := r.handleFinalizers(logCtx, app, handler)
 	if err != nil {
 		if app.GetDeletionTimestamp() == nil {
@@ -152,6 +160,22 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if endReconcile {
 		return result, nil
 	}
+
+	// Apply Application-scoped policy transforms
+	logCtx, err = handler.ApplyApplicationScopeTransforms(logCtx, app)
+	if err != nil {
+		logCtx.Error(err, "Failed to apply Application-scoped policy transforms")
+		return r.endWithNegativeCondition(logCtx, app, condition.ReconcileError(err), common.ApplicationStarting)
+	}
+
+	// Update Application metadata (labels/annotations) if policies modified them
+	// This is safe because metadata changes don't trigger new ApplicationRevisions
+	if err := handler.UpdateApplicationMetadata(logCtx, app); err != nil {
+		logCtx.Error(err, "Failed to update Application metadata from policies")
+		// Non-fatal error - continue with reconciliation
+	}
+
+	r.emitPolicyEvents(app)
 
 	appFile, err := appParser.GenerateAppFile(logCtx, app)
 	if err != nil {
@@ -166,11 +190,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		r.Recorder.Event(app, event.Warning(velatypes.ReasonFailedRevision, err))
 		return r.endWithNegativeCondition(logCtx, app, condition.ErrorCondition("Revision", err), common.ApplicationRendering)
 	}
+
 	if err := handler.FinalizeAndApplyAppRevision(logCtx); err != nil {
 		logCtx.Error(err, "Failed to apply app revision")
 		r.Recorder.Event(app, event.Warning(velatypes.ReasonFailedRevision, err))
 		return r.endWithNegativeCondition(logCtx, app, condition.ErrorCondition("Revision", err), common.ApplicationRendering)
 	}
+
 	logCtx.Info("Successfully prepare current app revision", "revisionName", handler.currentAppRev.Name,
 		"revisionHash", handler.currentRevHash, "isNewRevision", handler.isNewRevision)
 	app.Status.SetConditions(condition.ReadyCondition("Revision"))
@@ -190,7 +216,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	app.Status.SetConditions(condition.ReadyCondition(common.PolicyCondition.String()))
 	r.Recorder.Event(app, event.Normal(velatypes.ReasonPolicyGenerated, velatypes.MessagePolicyGenerated))
 
-	handler.CheckWorkflowRestart(logCtx, app)
+	// Check if workflow needs restart (combines scheduled restart + revision-based restart)
+	r.checkWorkflowRestart(logCtx, app, handler)
 
 	workflowInstance, runners, err := handler.GenerateApplicationSteps(logCtx, app, appParser, appFile)
 	if err != nil {
@@ -215,15 +242,46 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	handler.addServiceStatus(false, app.Status.Services...)
+	app.Status.Services = handler.services
+
 	handler.addAppliedResource(true, app.Status.AppliedResources...)
 	app.Status.AppliedResources = handler.appliedResources
-	app.Status.Services = handler.services
+
+	// Remove services[] entries for components that no longer exist in spec
+	filteredServices, componentsRemoved := filterRemovedComponentsFromStatus(
+		app.Spec.Components,
+		app.Status.Services,
+	)
+	app.Status.Services = filteredServices
+	handler.services = filteredServices
+
+	if componentsRemoved {
+		logCtx.Info("Removed deleted components from status")
+	}
+
 	workflowUpdated := app.Status.Workflow.Message != "" && workflowInstance.Status.Message == ""
 	workflowInstance.Status.Phase = workflowState
 	app.Status.Workflow = workflow.ConvertWorkflowStatus(workflowInstance.Status, app.Status.Workflow.AppRevision)
 	logCtx.Info(fmt.Sprintf("Workflow return state=%s", workflowState))
+	postDispatchApplied := false
+	applyPostDispatchTraits := func() error {
+		if postDispatchApplied || !feature.DefaultMutableFeatureGate.Enabled(features.MultiStageComponentApply) {
+			return nil
+		}
+		if err := handler.applyPostDispatchTraits(logCtx, appParser, appFile); err != nil {
+			logCtx.Error(err, "Failed to apply PostDispatch traits")
+			r.Recorder.Event(app, event.Warning(velatypes.ReasonFailedApply, err))
+			return err
+		}
+		app.Status.AppliedResources = handler.appliedResources
+		postDispatchApplied = true
+		return nil
+	}
 	switch workflowState {
 	case workflowv1alpha1.WorkflowStateSuspending:
+		if err := applyPostDispatchTraits(); err != nil {
+			return r.endWithNegativeCondition(logCtx, app, condition.ReconcileError(err), common.ApplicationWorkflowSuspending)
+		}
 		if duration := workflowExecutor.GetSuspendBackoffWaitTime(); duration > 0 {
 			_, err = r.gcResourceTrackers(logCtx, handler, common.ApplicationWorkflowSuspending, false, workflowUpdated)
 			return r.result(err).requeue(duration).ret()
@@ -243,6 +301,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		}
 		return r.gcResourceTrackers(logCtx, handler, common.ApplicationWorkflowFailed, false, workflowUpdated)
 	case workflowv1alpha1.WorkflowStateExecuting:
+		if err := applyPostDispatchTraits(); err != nil {
+			return r.endWithNegativeCondition(logCtx, app, condition.ReconcileError(err), common.ApplicationRunningWorkflow)
+		}
 		_, err = r.gcResourceTrackers(logCtx, handler, common.ApplicationRunningWorkflow, false, workflowUpdated)
 		return r.result(err).requeue(workflowExecutor.GetBackoffWaitTime()).ret()
 	case workflowv1alpha1.WorkflowStateSucceeded:
@@ -250,14 +311,26 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			r.doWorkflowFinish(logCtx, app, handler, workflowState)
 		}
 	case workflowv1alpha1.WorkflowStateSkipped:
+		if err := applyPostDispatchTraits(); err != nil {
+			return r.endWithNegativeCondition(logCtx, app, condition.ReconcileError(err), common.ApplicationRunningWorkflow)
+		}
 		return r.result(nil).requeue(workflowExecutor.GetBackoffWaitTime()).ret()
 	default:
 	}
+
+	// Rebuild appliedResources from the ResourceTracker now that the workflow has finished
+	// dispatching. The RT is the authoritative source
+	app.Status.AppliedResources = handler.resourceKeeper.GetAppliedResources()
 
 	var phase = common.ApplicationRunning
 	isHealthy := evalStatus(logCtx, handler, appFile, appParser)
 	if !isHealthy {
 		phase = common.ApplicationUnhealthy
+	}
+
+	// Apply PostDispatch traits for healthy components if not already done in workflow requeue branch
+	if err := applyPostDispatchTraits(); err != nil {
+		return r.endWithNegativeCondition(logCtx, app, condition.ReconcileError(err), phase)
 	}
 
 	r.stateKeep(logCtx, handler, app)
@@ -285,7 +358,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		Reason:             condition.ReasonReconcileSuccess,
 	})
 	r.Recorder.Event(app, event.Normal(velatypes.ReasonDeployed, velatypes.MessageDeployed))
-	return r.gcResourceTrackers(logCtx, handler, phase, true, false)
+	// Use Update instead of Patch when components were removed to properly clear status arrays
+	return r.gcResourceTrackers(logCtx, handler, phase, true, componentsRemoved)
 }
 
 func (r *Reconciler) stateKeep(logCtx monitorContext.Context, handler *AppHandler, app *v1beta1.Application) {
@@ -338,7 +412,7 @@ func (r *Reconciler) gcResourceTrackers(logCtx monitorContext.Context, handler *
 		cond := condition.Deleting()
 		cond.Message = fmt.Sprintf("error encountered during garbage collection: %s", err.Error())
 		handler.app.Status.SetConditions(cond)
-		return r.result(statusUpdater(logCtx, handler.app, phase)).ret()
+		return r.result(statusUpdater(logCtx, handler.app, phase)).forApp(handler.app).ret()
 	}
 	if !finished {
 		logCtx.Info("GarbageCollecting resourcetrackers unfinished")
@@ -350,16 +424,41 @@ func (r *Reconciler) gcResourceTrackers(logCtx monitorContext.Context, handler *
 		return r.result(statusUpdater(logCtx, handler.app, phase)).requeue(baseGCBackoffWaitTime).ret()
 	}
 	logCtx.Info("GarbageCollected resourcetrackers")
-	return r.result(statusUpdater(logCtx, handler.app, phase)).ret()
+	return r.result(statusUpdater(logCtx, handler.app, phase)).forApp(handler.app).ret()
 }
 
 type reconcileResult struct {
 	time.Duration
-	err error
+	err           error
+	defaultResync time.Duration
 }
 
 func (r *reconcileResult) requeue(d time.Duration) *reconcileResult {
 	r.Duration = d
+	return r
+}
+
+// forApp overrides the default resync period with the per-application value
+// parsed from the AnnotationReconcileInterval annotation, if present and valid.
+func (r *reconcileResult) forApp(app *v1beta1.Application) *reconcileResult {
+	if app == nil || app.Annotations == nil {
+		return r
+	}
+	v, ok := app.Annotations[oam.AnnotationReconcileInterval]
+	if !ok {
+		return r
+	}
+	d, err := time.ParseDuration(v)
+	switch {
+	case err != nil:
+		klog.Warningf("ignoring invalid %s annotation %q on application %s/%s, using global default",
+			oam.AnnotationReconcileInterval, v, app.Namespace, app.Name)
+	case d < minPerAppResyncPeriod:
+		klog.Warningf("ignoring %s annotation %q below minimum %s on application %s/%s, using global default",
+			oam.AnnotationReconcileInterval, v, minPerAppResyncPeriod, app.Namespace, app.Name)
+	default:
+		r.defaultResync = d
+	}
 	return r
 }
 
@@ -369,7 +468,7 @@ func (r *reconcileResult) ret() (ctrl.Result, error) {
 	} else if r.err != nil {
 		return ctrl.Result{}, r.err
 	}
-	return ctrl.Result{RequeueAfter: common2.ApplicationReSyncPeriod}, nil
+	return ctrl.Result{RequeueAfter: r.defaultResync}, nil
 }
 
 func (r *reconcileResult) end(endReconcile bool) (bool, ctrl.Result, error) {
@@ -378,7 +477,7 @@ func (r *reconcileResult) end(endReconcile bool) (bool, ctrl.Result, error) {
 }
 
 func (r *Reconciler) result(err error) *reconcileResult {
-	return &reconcileResult{err: err}
+	return &reconcileResult{err: err, defaultResync: common2.ApplicationReSyncPeriod}
 }
 
 // NOTE Because resource tracker is cluster-scoped resources, we cannot garbage collect them
@@ -416,6 +515,7 @@ func (r *Reconciler) handleFinalizers(ctx monitorContext.Context, app *v1beta1.A
 				}
 				meta.RemoveFinalizer(app, oam.FinalizerResourceTracker)
 				meta.RemoveFinalizer(app, oam.FinalizerOrphanResource)
+				applicationPolicyCache.InvalidateApplication(app.Namespace, app.Name)
 				return r.result(errors.Wrap(r.Client.Update(ctx, app), errUpdateApplicationFinalizer)).end(true)
 			}
 			if wfContext.EnableInMemoryContext {
@@ -427,12 +527,20 @@ func (r *Reconciler) handleFinalizers(ctx monitorContext.Context, app *v1beta1.A
 	return r.result(nil).end(false)
 }
 
-func (r *Reconciler) endWithNegativeCondition(ctx context.Context, app *v1beta1.Application, condition condition.Condition, phase common.ApplicationPhase) (ctrl.Result, error) {
-	app.SetConditions(condition)
+func (r *Reconciler) endWithNegativeCondition(ctx context.Context, app *v1beta1.Application, cond condition.Condition, phase common.ApplicationPhase) (ctrl.Result, error) {
+	// Flip the rollup Ready condition alongside the failing sub-condition so health checkers
+	// polling Ready see the failure instead of the last successful reconcile (#7164).
+	app.SetConditions(cond, condition.Condition{
+		Type:               condition.ConditionType(common.ReadyCondition.String()),
+		Status:             corev1.ConditionFalse,
+		LastTransitionTime: metav1.Now(),
+		Reason:             condition.ReasonReconcileError,
+		Message:            cond.Message,
+	})
 	if err := r.patchStatus(ctx, app, phase); err != nil {
 		return r.result(errors.WithMessage(err, "cannot update application status")).ret()
 	}
-	return r.result(fmt.Errorf("object level reconcile error, type: %q, msg: %q", string(condition.Type), condition.Message)).ret()
+	return r.result(fmt.Errorf("object level reconcile error, type: %q, msg: %q", string(cond.Type), cond.Message)).ret()
 }
 
 // Application status can be updated by two methods: patch and update.
@@ -482,6 +590,36 @@ func (r *Reconciler) writeStatusByMethod(ctx context.Context, method method, app
 	return nil
 }
 
+func (r *Reconciler) emitPolicyEvents(app *v1beta1.Application) {
+	for _, appliedPolicy := range app.Status.AppliedApplicationPolicies {
+		isGlobal := appliedPolicy.Source == PolicySourceGlobal
+		if appliedPolicy.Applied {
+			if isGlobal {
+				r.Recorder.Event(app, event.Normal("GlobalPolicyApplied",
+					fmt.Sprintf("Applied global policy %s from namespace %s", appliedPolicy.Name, appliedPolicy.Namespace)))
+			} else {
+				r.Recorder.Event(app, event.Normal("PolicyApplied",
+					fmt.Sprintf("Applied policy %s", appliedPolicy.Name)))
+			}
+		} else {
+			switch {
+			case appliedPolicy.Error && isGlobal:
+				r.Recorder.Event(app, event.Warning("GlobalPolicyFailed",
+					errors.Errorf("failed to render global policy %s: %s", appliedPolicy.Name, appliedPolicy.Message)))
+			case appliedPolicy.Error:
+				r.Recorder.Event(app, event.Warning("PolicyFailed",
+					errors.Errorf("failed to render policy %s: %s", appliedPolicy.Name, appliedPolicy.Message)))
+			case isGlobal:
+				r.Recorder.Event(app, event.Normal("GlobalPolicySkipped",
+					fmt.Sprintf("Skipped global policy %s: %s", appliedPolicy.Name, appliedPolicy.Message)))
+			default:
+				r.Recorder.Event(app, event.Normal("PolicySkipped",
+					fmt.Sprintf("Skipped policy %s: %s", appliedPolicy.Name, appliedPolicy.Message)))
+			}
+		}
+	}
+}
+
 func (r *Reconciler) doWorkflowFinish(logCtx monitorContext.Context, app *v1beta1.Application, handler *AppHandler, state workflowv1alpha1.WorkflowRunPhase) {
 	logCtx = logCtx.Fork("do-workflow-finish", monitorContext.DurationMetric(func(v float64) {
 		metrics.AppReconcileStageDurationHistogram.WithLabelValues("do-workflow-finish").Observe(v)
@@ -517,6 +655,9 @@ func isHealthy(services []common.ApplicationComponentStatus) bool {
 			return false
 		}
 		for _, tr := range service.Traits {
+			if tr.Pending {
+				continue
+			}
 			if !tr.Healthy {
 				return false
 			}
@@ -589,6 +730,10 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 				return true
 			},
 		}).
+		Watches(
+			&v1beta1.PolicyDefinition{},
+			ctrlHandler.EnqueueRequestsFromMapFunc(r.handlePolicyDefinitionChange),
+		).
 		For(&v1beta1.Application{}).
 		Complete(r)
 }
@@ -598,6 +743,12 @@ func Setup(mgr ctrl.Manager, args core.Args) error {
 	// Register application status metrics after feature gates are initialized
 	metrics.RegisterApplicationStatusMetrics()
 
+	// Add a runnable to initialize PolicyScopeIndex after manager starts
+	// This ensures the cache is ready before we try to list PolicyDefinitions
+	if err := mgr.Add(&policyScopeIndexInitializer{client: mgr.GetClient()}); err != nil {
+		return err
+	}
+
 	reconciler := Reconciler{
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
@@ -605,6 +756,25 @@ func Setup(mgr ctrl.Manager, args core.Args) error {
 		options:  parseOptions(args),
 	}
 	return reconciler.SetupWithManager(mgr)
+}
+
+// policyScopeIndexInitializer is a Runnable that initializes the PolicyScopeIndex
+// after the manager's cache has started
+type policyScopeIndexInitializer struct {
+	client client.Client
+}
+
+func (r *policyScopeIndexInitializer) Start(ctx context.Context) error {
+	klog.InfoS("Starting PolicyScopeIndex initialization (waiting for cache sync)")
+
+	// The manager will call this after the cache is synced
+	if err := policyScopeIndex.Initialize(ctx, r.client); err != nil {
+		klog.ErrorS(err, "Failed to initialize PolicyScopeIndex, continuing with empty index")
+		// Non-fatal - index will be populated by watch events
+	}
+
+	// Return nil to indicate successful start (we run once and complete)
+	return nil
 }
 
 func updateObservedGeneration(app *v1beta1.Application) {
@@ -625,6 +795,30 @@ func filterManagedFieldChangesUpdate(e ctrlEvent.UpdateEvent) bool {
 	newTracker.ManagedFields = old.ManagedFields
 	newTracker.ResourceVersion = old.ResourceVersion
 	return !reflect.DeepEqual(newTracker, old)
+}
+
+func (r *Reconciler) handlePolicyDefinitionChange(ctx context.Context, obj client.Object) []reconcile.Request {
+	policy := obj.(*v1beta1.PolicyDefinition)
+
+	// Update the in-memory index so the next reconcile sees the new/updated policy.
+	// Without this, newly created global PolicyDefinitions are invisible until the
+	// controller restarts (the index is only populated once at startup).
+	if policy.GetDeletionTimestamp() != nil {
+		policyScopeIndex.Delete(policy.Name, policy.Namespace)
+	} else {
+		policyScopeIndex.AddOrUpdate(policy)
+	}
+
+	// Invalidate rendered policy cache when global policies change
+	if policy.Namespace == oam.SystemDefinitionNamespace {
+		// vela-system policy affects all namespaces - invalidate entire cache
+		applicationPolicyCache.InvalidateAll()
+	} else {
+		// Namespace-specific policy - invalidate for that namespace
+		applicationPolicyCache.InvalidateForNamespace(policy.Namespace)
+	}
+
+	return []reconcile.Request{}
 }
 
 func findObjectForResourceTracker(_ context.Context, rt client.Object) []reconcile.Request {
@@ -679,6 +873,8 @@ const (
 	ReplicaKeyContextKey
 	// OriginalAppKey is the key in the context that records the in coming original app
 	OriginalAppKey
+	// PolicyAdditionalContextKey is the key in the context that records additional context from Application-scoped policies
+	PolicyAdditionalContextKey
 )
 
 func withOriginalApp(ctx context.Context, app *v1beta1.Application) context.Context {
@@ -694,6 +890,29 @@ func setVelaVersion(app *v1beta1.Application) {
 	if annotations := app.GetAnnotations(); annotations == nil || annotations[oam.AnnotationKubeVelaVersion] == "" {
 		metav1.SetMetaDataAnnotation(&app.ObjectMeta, oam.AnnotationKubeVelaVersion, version.VelaVersion)
 	}
+}
+
+// filterRemovedComponentsFromStatus removes services[] entries for components no longer in spec.
+// Returns filtered services and whether any were removed (used to determine Update vs Patch).
+func filterRemovedComponentsFromStatus(
+	components []common.ApplicationComponent,
+	services []common.ApplicationComponentStatus,
+) (filteredServices []common.ApplicationComponentStatus, removed bool) {
+	componentMap := make(map[string]struct{}, len(components))
+	for _, comp := range components {
+		componentMap[comp.Name] = struct{}{}
+	}
+
+	filteredServices = make([]common.ApplicationComponentStatus, 0, len(services))
+	for _, svc := range services {
+		if _, found := componentMap[svc.Name]; found {
+			filteredServices = append(filteredServices, svc)
+		} else {
+			removed = true
+		}
+	}
+
+	return filteredServices, removed
 }
 
 func evalStatus(ctx monitorContext.Context, handler *AppHandler, appFile *appfile.Appfile, appParser *appfile.Parser) bool {

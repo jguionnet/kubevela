@@ -16,6 +16,8 @@ limitations under the License.
 
 package oam
 
+import "strings"
+
 // Label key strings.
 // AppConfig controller will add these labels into workloads.
 const (
@@ -159,8 +161,29 @@ const (
 	// AnnotationAutoUpdate is annotation that let application auto update when it finds definition changes
 	AnnotationAutoUpdate = "app.oam.dev/autoUpdate"
 
+	// AnnotationAutoRevision controls whether policy-rendered spec changes create new ApplicationRevisions.
+	// When set to "true", policies can modify Application.Spec and trigger new revisions.
+	// This is orthogonal to AnnotationAutoUpdate which controls definition version updates.
+	AnnotationAutoRevision = "policy.oam.dev/auto-revision"
+
+	// AnnotationSkipGlobalPolicies controls whether global (vela-system) policies are skipped for an Application.
+	// When set to "true", only explicitly declared spec.policies are evaluated.
+	AnnotationSkipGlobalPolicies = "policy.oam.dev/skip-global"
+	// AnnotationForceParamMutations bypasses all immutable parameter field validation when set to "true".
+	AnnotationForceParamMutations = "app.oam.dev/force-param-mutations"
+
 	// AnnotationWorkflowName specifies the workflow name for execution.
 	AnnotationWorkflowName = "app.oam.dev/workflowName"
+
+	// AnnotationWorkflowRestart triggers a workflow restart when set. Supported values:
+	// - "true": Immediate restart (sets restart time to current time + 1 second).
+	//   Annotation is automatically removed after being processed.
+	// - RFC3339 timestamp (e.g., "2025-01-15T14:30:00Z"): One-time restart at specified time.
+	//   Annotation is automatically removed after being processed.
+	// - Duration (e.g., "5m", "1h", "30s"): Recurring restart with minimum interval after each completion.
+	//   Annotation persists; automatically reschedules after each workflow completion.
+	// All modes are GitOps-safe: the schedule is stored in status.workflowRestartScheduledAt.
+	AnnotationWorkflowRestart = "app.oam.dev/restart-workflow"
 
 	// AnnotationAppName specifies the name for application in db.
 	// Note: the annotation is only created by velaUX, please don't use it in other Source of Truth.
@@ -197,6 +220,12 @@ const (
 
 	// AnnotationSkipResume annotation indicates that the resource does not need to be resumed.
 	AnnotationSkipResume = "controller.core.oam.dev/skip-resume"
+
+	// AnnotationReconcileInterval overrides the global ApplicationReSyncPeriod on a
+	// per-application basis.  The value must be a valid Go duration string (e.g.
+	// "1m", "15m", "30s").  Values below 10s are ignored and fall back to the
+	// global default.  Invalid values are also ignored.
+	AnnotationReconcileInterval = "app.oam.dev/reconcile-interval"
 )
 
 const (
@@ -213,3 +242,43 @@ const (
 	// resources instead of deleting them
 	FinalizerOrphanResource = "app.oam.dev/orphan-resource"
 )
+
+// policyContextKeyType is a private type for Go context keys, preventing collisions.
+type policyContextKeyType string
+
+// PolicyAdditionalContextKey is the Go context key for storing policy output.ctx data.
+const PolicyAdditionalContextKey policyContextKeyType = "kubevela.oam.dev/policy-additional-context"
+
+// internalMetadataPrefixes lists key prefixes that are stripped when exposing Application
+// labels/annotations to policy CUE templates. Add prefixes here to prevent policies from
+// reading internal platform metadata.
+var internalMetadataPrefixes = map[string]struct{}{
+	"app.oam.dev/":           {},
+	"oam.dev/":               {},
+	"kubectl.kubernetes.io/": {},
+	"kubernetes.io/":         {},
+	"k8s.io/":                {},
+	"helm.sh/":               {},
+	"app.kubernetes.io/":     {},
+}
+
+// FilterInternalMetadata returns a copy of metadata with internal platform keys removed.
+// Returns nil when the result would be empty.
+func FilterInternalMetadata(metadata map[string]string) map[string]string {
+	if len(metadata) == 0 {
+		return nil
+	}
+	filtered := make(map[string]string, len(metadata))
+	for k, v := range metadata {
+		if idx := strings.IndexByte(k, '/'); idx > 0 {
+			if _, isInternal := internalMetadataPrefixes[k[:idx+1]]; isInternal {
+				continue
+			}
+		}
+		filtered[k] = v
+	}
+	if len(filtered) == 0 {
+		return nil
+	}
+	return filtered
+}

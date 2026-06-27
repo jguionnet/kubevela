@@ -158,7 +158,7 @@ func (d *Option) ExecuteDryRun(ctx context.Context, application *v1beta1.Applica
 	if err != nil {
 		return nil, nil, errors.WithMessage(err, "cannot generate manifests from components and traits")
 	}
-	policyManifests, err := appFile.GeneratePolicyManifests(ctx)
+	policyManifests, err := appFile.GeneratePolicyManifests(ctx, d.Client)
 	if err != nil {
 		return nil, nil, errors.WithMessage(err, "cannot generate manifests from policies")
 	}
@@ -178,7 +178,8 @@ func (d *Option) PrintDryRun(buff *bytes.Buffer, appName string, comps []*types.
 		components[comp.Name] = comp.ComponentOutput
 	}
 	for _, c := range comps {
-		if _, err := fmt.Fprintf(buff, "---\n# Application(%s) -- Component(%s) \n---\n\n", appName, c.Name); err != nil {
+		_, err := fmt.Fprintf(buff, "---\n# Application(%s) -- Component(%s)\n---\n\n", appName, c.Name)
+		if err != nil {
 			return errors.Wrap(err, "fail to write buff")
 		}
 		result, err := yaml.Marshal(components[c.Name])
@@ -191,9 +192,9 @@ func (d *Option) PrintDryRun(buff *bytes.Buffer, appName string, comps []*types.
 			traitType := t.GetLabels()[oam.TraitTypeLabel]
 			switch {
 			case traitType == definition.AuxiliaryWorkload:
-				buff.WriteString("## From the auxiliary workload \n")
+				buff.WriteString("## From the auxiliary workload\n")
 			case traitType != "":
-				fmt.Fprintf(buff, "## From the trait %s \n", traitType)
+				fmt.Fprintf(buff, "## From the trait %s\n", traitType)
 			}
 			result, err := yaml.Marshal(t)
 			if err != nil {
@@ -205,7 +206,8 @@ func (d *Option) PrintDryRun(buff *bytes.Buffer, appName string, comps []*types.
 		buff.WriteString("\n")
 	}
 	for _, plc := range policies {
-		if _, err := fmt.Fprintf(buff, "---\n# Application(%s) -- Policy(%s) \n---\n\n", appName, plc.GetName()); err != nil {
+		_, err := fmt.Fprintf(buff, "---\n# Application(%s) -- Policy(%s)\n---\n\n", appName, plc.GetName())
+		if err != nil {
 			return errors.Wrap(err, "fail to write buff")
 		}
 		result, err := yaml.Marshal(plc)

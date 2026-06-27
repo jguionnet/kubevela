@@ -21,6 +21,7 @@ import (
 
 	workflowv1alpha1 "github.com/kubevela/workflow/api/v1alpha1"
 	"k8s.io/klog/v2"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/common"
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1beta1"
@@ -35,15 +36,24 @@ type HealthStatus struct {
 }
 
 // updateMetricsAndLog updates Prometheus metrics and logs application status with service details
-func (r *Reconciler) updateMetricsAndLog(_ context.Context, app *v1beta1.Application) {
+func (r *Reconciler) updateMetricsAndLog(ctx context.Context, app *v1beta1.Application) {
 	healthStatus := calculateHealthStatus(app.Status.Services)
 
 	updateHealthMetric(app, healthStatus.Healthy)
 	updatePhaseMetrics(app)
 
+	specApp := app
+	if app.Status.LatestRevision != nil && app.Status.LatestRevision.Name != "" {
+		appRev := &v1beta1.ApplicationRevision{}
+		if err := r.Get(ctx, client.ObjectKey{Name: app.Status.LatestRevision.Name, Namespace: app.Namespace}, appRev); err == nil {
+			specApp = appRev.Spec.Application.DeepCopy()
+		}
+	}
+
 	workflowStatus := buildWorkflowStatus(app.Status.Workflow)
-	serviceDetails := buildServiceDetails(app.Status.Services)
-	logApplicationStatus(app, healthStatus, workflowStatus, serviceDetails)
+	serviceDetails := buildServiceDetails(specApp, app.Status.Services)
+	policyDetails := buildAppliedPoliciesLog(app.Status.AppliedApplicationPolicies)
+	logApplicationStatus(app, healthStatus, workflowStatus, serviceDetails, policyDetails)
 }
 
 // calculateHealthStatus calculates the health status from services
@@ -106,13 +116,24 @@ func buildWorkflowStatus(workflow *common.WorkflowStatus) map[string]interface{}
 	}
 }
 
+// getComponentType looks up the component type from the application spec
+func getComponentType(app *v1beta1.Application, componentName string) string {
+	for _, comp := range app.Spec.Components {
+		if comp.Name == componentName {
+			return comp.Type
+		}
+	}
+	return ""
+}
+
 // buildServiceDetails builds service details for logging
-func buildServiceDetails(services []common.ApplicationComponentStatus) []map[string]interface{} {
+func buildServiceDetails(app *v1beta1.Application, services []common.ApplicationComponentStatus) []map[string]interface{} {
 	serviceDetails := make([]map[string]interface{}, 0, len(services))
 
 	for _, svc := range services {
 		svcDetails := map[string]interface{}{
 			"name":      svc.Name,
+			"type":      getComponentType(app, svc.Name),
 			"namespace": svc.Namespace,
 			"cluster":   svc.Cluster,
 			"healthy":   svc.Healthy,
@@ -121,14 +142,65 @@ func buildServiceDetails(services []common.ApplicationComponentStatus) []map[str
 		if len(svc.Details) > 0 {
 			svcDetails["details"] = svc.Details
 		}
+		if len(svc.Traits) > 0 {
+			traits := make([]map[string]interface{}, 0, len(svc.Traits))
+			for _, trait := range svc.Traits {
+				traitDetails := map[string]interface{}{
+					"type":    trait.Type,
+					"healthy": trait.Healthy,
+				}
+				if trait.Message != "" {
+					traitDetails["message"] = trait.Message
+				}
+				if len(trait.Details) > 0 {
+					traitDetails["details"] = trait.Details
+				}
+				traits = append(traits, traitDetails)
+			}
+			svcDetails["traits"] = traits
+		}
 		serviceDetails = append(serviceDetails, svcDetails)
 	}
 
 	return serviceDetails
 }
 
+// buildAppliedPoliciesLog builds a summary of applied application policies for logging.
+func buildAppliedPoliciesLog(policies []common.AppliedApplicationPolicy) []map[string]interface{} {
+	if len(policies) == 0 {
+		return nil
+	}
+	result := make([]map[string]interface{}, 0, len(policies))
+	for _, p := range policies {
+		entry := map[string]interface{}{
+			"name":    p.Name,
+			"type":    p.Type,
+			"source":  p.Source,
+			"applied": p.Applied,
+		}
+		if p.Error {
+			entry["error"] = true
+		}
+		if p.Message != "" {
+			entry["message"] = p.Message
+		}
+		if p.SpecModified || p.LabelsCount > 0 || p.AnnotationsCount > 0 || p.HasContext {
+			entry["spec_modified"] = p.SpecModified
+			entry["labels_count"] = p.LabelsCount
+			entry["annotations_count"] = p.AnnotationsCount
+			entry["has_context"] = p.HasContext
+		}
+		if p.DefinitionRevisionName != "" {
+			entry["definition_revision"] = p.DefinitionRevisionName
+			entry["revision"] = p.Revision
+		}
+		result = append(result, entry)
+	}
+	return result
+}
+
 // logApplicationStatus logs the application status with structured data
-func logApplicationStatus(app *v1beta1.Application, healthStatus HealthStatus, workflowStatus map[string]interface{}, serviceDetails []map[string]interface{}) {
+func logApplicationStatus(app *v1beta1.Application, healthStatus HealthStatus, workflowStatus map[string]interface{}, serviceDetails []map[string]interface{}, policyDetails []map[string]interface{}) {
 	statusDetails := map[string]interface{}{
 		"app_uid":   app.UID,
 		"app_name":  app.Name,
@@ -142,6 +214,7 @@ func logApplicationStatus(app *v1beta1.Application, healthStatus HealthStatus, w
 			"unhealthy_services_count": healthStatus.UnhealthyCount,
 			"services":                 serviceDetails,
 			"workflow":                 workflowStatus,
+			"policies":                 policyDetails,
 		},
 	}
 

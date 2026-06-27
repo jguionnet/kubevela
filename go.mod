@@ -37,8 +37,8 @@ require (
 	github.com/hinshun/vt10x v0.0.0-20180616224451-1954e6464174
 	github.com/imdario/mergo v0.3.16
 	github.com/jeremywohl/flatten/v2 v2.0.0-20211013061545-07e4a09fb8e4
-	github.com/kubevela/pkg v1.9.3-0.20251015050342-14cd204ff6fc
-	github.com/kubevela/workflow v0.6.3-0.20250717221743-56b80cee4121
+	github.com/kubevela/pkg v1.10.0
+	github.com/kubevela/workflow v0.6.4
 	github.com/kyokomi/emoji v2.2.4+incompatible
 	github.com/magiconair/properties v1.8.7
 	github.com/mattn/go-runewidth v0.0.15
@@ -76,6 +76,7 @@ require (
 	golang.org/x/text v0.27.0
 	golang.org/x/tools v0.35.0
 	gomodules.xyz/jsonpatch/v2 v2.4.0
+	gopkg.in/yaml.v3 v3.0.1
 	helm.sh/helm/v3 v3.14.4
 	k8s.io/api v0.31.10
 	k8s.io/apiextensions-apiserver v0.31.10
@@ -294,7 +295,6 @@ require (
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 	gopkg.in/warnings.v0 v0.1.2 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
 	k8s.io/klog v1.0.0 // indirect
 	k8s.io/kms v0.31.10 // indirect
 	k8s.io/kube-openapi v0.0.0-20250610211856-8b98d1ed966a // indirect

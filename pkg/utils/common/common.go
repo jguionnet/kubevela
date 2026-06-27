@@ -31,6 +31,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime/debug"
+	"strings"
 
 	"cuelang.org/go/cue"
 	"cuelang.org/go/cue/cuecontext"
@@ -38,6 +39,7 @@ import (
 	"github.com/AlecAivazis/survey/v2"
 	"github.com/hashicorp/hcl/v2/hclparse"
 	cuexv1alpha1 "github.com/kubevela/pkg/apis/cue/v1alpha1"
+	"github.com/kubevela/pkg/cue/cuex"
 	workflowv1alpha1 "github.com/kubevela/workflow/api/v1alpha1"
 	clustergatewayapi "github.com/oam-dev/cluster-gateway/pkg/apis/cluster/v1alpha1"
 	"github.com/oam-dev/terraform-config-inspect/tfconfig"
@@ -101,10 +103,15 @@ func init() {
 type HTTPOption struct {
 	Username        string `json:"username,omitempty"`
 	Password        string `json:"password,omitempty"`
+	BearerToken     string `json:"bearerToken,omitempty"` // RFC 6750. Mutually exclusive with Username/Password.
 	CaFile          string `json:"caFile,omitempty"`
 	CertFile        string `json:"certFile,omitempty"`
 	KeyFile         string `json:"keyFile,omitempty"`
 	InsecureSkipTLS bool   `json:"insecureSkipTLS,omitempty"`
+	// PlainHTTP signals that the caller wants the OCI client to use plain
+	// HTTP rather than TLS. Honored only on the OCI fetch path. Insecure
+	// by design; users opt in via the Opaque Secret key insecurePlainHTTP.
+	PlainHTTP bool `json:"plainHTTP,omitempty"`
 }
 
 // InitBaseRestConfig will return reset config for create controller runtime client
@@ -136,6 +143,14 @@ func HTTPGetResponse(ctx context.Context, url string, opts *HTTPOption) (*http.R
 	if opts != nil && len(opts.Username) != 0 && len(opts.Password) != 0 {
 		req.SetBasicAuth(opts.Username, opts.Password)
 	}
+	if opts != nil && opts.BearerToken != "" {
+		if opts.Username != "" || opts.Password != "" {
+			return nil, fmt.Errorf(
+				"HTTPOption sets both basic-auth and a bearer token: " +
+					"at most one credential method MUST be configured (RFC 6750 §2)")
+		}
+		req.Header.Set("Authorization", "Bearer "+opts.BearerToken)
+	}
 	if opts != nil && opts.InsecureSkipTLS {
 		httpClient.Transport = &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}} // nolint
 	}
@@ -165,7 +180,13 @@ func HTTPGetResponse(ctx context.Context, url string, opts *HTTPOption) (*http.R
 	return httpClient.Do(req)
 }
 
-// HTTPGetWithOption use HTTP option and default client to send get request
+// HTTPGetWithOption use HTTP option and default client to send get request.
+// Non-2xx responses are surfaced as an error including the status line plus a
+// truncated body excerpt. Without this guard, registry 401/403 bodies (HTML
+// or short text) would be returned as raw bytes and later parsed as YAML or
+// gzip-tar, producing misleading "no chart name found" / "cannot unmarshal
+// string into Go value of type repo.IndexFile" failures instead of a clear
+// "HTTP 401 Unauthorized" message.
 func HTTPGetWithOption(ctx context.Context, url string, opts *HTTPOption) ([]byte, error) {
 	resp, err := HTTPGetResponse(ctx, url, opts)
 	if err != nil {
@@ -173,6 +194,14 @@ func HTTPGetWithOption(ctx context.Context, url string, opts *HTTPOption) ([]byt
 	}
 	//nolint:errcheck
 	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		excerpt := strings.TrimSpace(string(body))
+		if excerpt == "" {
+			return nil, fmt.Errorf("HTTP %s", resp.Status)
+		}
+		return nil, fmt.Errorf("HTTP %s: %s", resp.Status, excerpt)
+	}
 	return io.ReadAll(resp.Body)
 }
 
@@ -207,6 +236,29 @@ func GetCUEParameterValue(cueStr string) (cue.Value, error) {
 		return cue.Value{}, velacue.ErrParameterNotExist
 	}
 
+	return val, nil
+}
+
+// GetCUExParameterValue converts definitions with cuex imports to cue format and extracts parameter field.
+// An optional *cuex.Compiler can be passed to override the default compiler (e.g. to use one that has
+// additional internal packages such as vela/builtin or vela/multicluster registered).
+func GetCUExParameterValue(ctx context.Context, cueStr string, compilers ...*cuex.Compiler) (cue.Value, error) {
+	compiler := cuex.DefaultCompiler.Get()
+	if len(compilers) > 0 && compilers[0] != nil {
+		compiler = compilers[0]
+	}
+	template, err := compiler.CompileStringWithOptions(
+		ctx,
+		cueStr+velacue.BaseTemplate,
+		cuex.DisableResolveProviderFunctions{},
+	)
+	if err != nil {
+		return cue.Value{}, err
+	}
+	val := template.LookupPath(cue.ParsePath(process.ParameterFieldName))
+	if !val.Exists() {
+		return cue.Value{}, velacue.ErrParameterNotExist
+	}
 	return val, nil
 }
 

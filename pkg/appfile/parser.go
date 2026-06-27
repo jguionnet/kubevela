@@ -31,6 +31,7 @@ import (
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	wfTypesv1alpha1 "github.com/kubevela/pkg/apis/oam/v1alpha1"
 	monitorContext "github.com/kubevela/pkg/monitor/context"
 	workflowv1alpha1 "github.com/kubevela/workflow/api/v1alpha1"
 
@@ -111,6 +112,12 @@ func (p *Parser) GenerateAppFileFromApp(ctx context.Context, app *v1beta1.Applic
 	appFile := newAppFile(app)
 	if app.Status.LatestRevision != nil {
 		appFile.AppRevisionName = app.Status.LatestRevision.Name
+	}
+
+	if monCtx, ok := ctx.(monitorContext.Context); ok {
+		appFile.Context = monCtx.GetContext()
+	} else {
+		appFile.Context = ctx
 	}
 
 	var err error
@@ -325,6 +332,14 @@ func (p *Parser) parsePoliciesFromRevision(ctx context.Context, af *Appfile) (er
 		return err
 	}
 	for _, policy := range af.Policies {
+		if af.AppRevision != nil && af.AppRevision.Spec.PolicyDefinitions != nil {
+			if policyDef, ok := af.AppRevision.Spec.PolicyDefinitions[policy.Type]; ok {
+				// Skip non-default policies - processed elsewhere
+				if policyDef.Spec.Scope != v1beta1.DefaultScope {
+					continue
+				}
+			}
+		}
 		if policy.Properties == nil && policy.Type != v1alpha1.DebugPolicyType {
 			return fmt.Errorf("policy %s named %s must not have empty properties", policy.Type, policy.Name)
 		}
@@ -357,6 +372,10 @@ func (p *Parser) parsePolicies(ctx context.Context, af *Appfile) (err error) {
 		return err
 	}
 	for _, policy := range af.Policies {
+		// Application-scoped policies are already processed in ApplyApplicationScopeTransforms()
+		if p.isApplicationScopedPolicy(ctx, policy.Type, af.app.Annotations) {
+			continue
+		}
 		if policy.Properties == nil && policy.Type != v1alpha1.DebugPolicyType {
 			return fmt.Errorf("policy %s named %s must not have empty properties", policy.Type, policy.Name)
 		}
@@ -394,10 +413,26 @@ func (p *Parser) parsePolicies(ctx context.Context, af *Appfile) (err error) {
 	return nil
 }
 
+// isApplicationScopedPolicy checks if a policy has a non-default Scope.
+// Policies with non-default scopes (e.g. "Application") are handled in specialized
+// pipelines before parsing and should not be added to ParsedPolicies.
+// Returns true if the policy has ANY non-default scope (Scope != DefaultScope).
+func (p *Parser) isApplicationScopedPolicy(ctx context.Context, policyType string, annotations map[string]string) bool {
+	policyDef := &v1beta1.PolicyDefinition{}
+
+	err := util.GetCapabilityDefinition(ctx, p.client, policyDef, policyType, annotations)
+	if err != nil {
+		// If not found or error, assume DefaultScope (safe default - include the policy)
+		return false
+	}
+
+	return policyDef.Spec.Scope != v1beta1.DefaultScope
+}
+
 func (p *Parser) loadWorkflowToAppfile(ctx context.Context, af *Appfile) error {
 	var err error
 	// parse workflow steps
-	af.WorkflowMode = &workflowv1alpha1.WorkflowExecuteMode{
+	af.WorkflowMode = &wfTypesv1alpha1.WorkflowExecuteMode{
 		Steps:    workflowv1alpha1.WorkflowModeDAG,
 		SubSteps: workflowv1alpha1.WorkflowModeDAG,
 	}
@@ -405,7 +440,7 @@ func (p *Parser) loadWorkflowToAppfile(ctx context.Context, af *Appfile) error {
 		app := af.app
 		mode := wfSpec.Mode
 		if wfSpec.Ref != "" && mode == nil {
-			wf := &workflowv1alpha1.Workflow{}
+			wf := &wfTypesv1alpha1.Workflow{}
 			if err := af.WorkflowClient(p.client).Get(ctx, ktypes.NamespacedName{Namespace: af.app.Namespace, Name: app.Spec.Workflow.Ref}, wf); err != nil {
 				return err
 			}

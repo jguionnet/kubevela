@@ -37,8 +37,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	wfTypesv1alpha1 "github.com/kubevela/pkg/apis/oam/v1alpha1"
 	velaclient "github.com/kubevela/pkg/controller/client"
-	workflowv1alpha1 "github.com/kubevela/workflow/api/v1alpha1"
 	"github.com/kubevela/workflow/pkg/cue/model/value"
 	"github.com/kubevela/workflow/pkg/cue/process"
 
@@ -177,23 +177,32 @@ type Appfile struct {
 	Policies      []v1beta1.AppPolicy
 	Components    []common.ApplicationComponent
 	Artifacts     []*types.ComponentManifest
-	WorkflowSteps []workflowv1alpha1.WorkflowStep
-	WorkflowMode  *workflowv1alpha1.WorkflowExecuteMode
+	WorkflowSteps []wfTypesv1alpha1.WorkflowStep
+	WorkflowMode  *wfTypesv1alpha1.WorkflowExecuteMode
 
 	ExternalPolicies map[string]*v1alpha1.Policy
-	ExternalWorkflow *workflowv1alpha1.Workflow
+	ExternalWorkflow *wfTypesv1alpha1.Workflow
 	ReferredObjects  []*unstructured.Unstructured
 
 	app *v1beta1.Application
+
+	// Context is the reconciliation context for the current Application, populated during
+	// controller reconcile and carried into rendering
+	Context context.Context
 
 	Debug bool
 }
 
 // GeneratePolicyManifests generates policy manifests from an appFile
 // internal policies like apply-once, topology, will not render manifests
-func (af *Appfile) GeneratePolicyManifests(_ context.Context) ([]*unstructured.Unstructured, error) {
+func (af *Appfile) GeneratePolicyManifests(ctx context.Context, cli client.Client) ([]*unstructured.Unstructured, error) {
 	var manifests []*unstructured.Unstructured
 	for _, policy := range af.ParsedPolicies {
+		// Skip Application-scoped policies - they were already processed in ApplyApplicationScopeTransforms
+		if af.isApplicationScopedPolicy(ctx, cli, policy) {
+			continue
+		}
+
 		un, err := af.generatePolicyUnstructured(policy)
 		if err != nil {
 			return nil, err
@@ -244,6 +253,36 @@ func generatePolicyUnstructuredFromCUEModule(comp *Component, artifacts []*types
 		res = append(res, tr)
 	}
 	return res, nil
+}
+
+// isApplicationScopedPolicy checks if a policy has a non-default Scope
+// Non-default scopes (e.g. ApplicationScope) are handled in specialized pipelines
+// Note: Backward compatible - unset Scope field defaults to empty string (DefaultScope)
+func (af *Appfile) isApplicationScopedPolicy(ctx context.Context, cli client.Client, policy *Component) bool {
+	var policyDef *v1beta1.PolicyDefinition
+
+	// Try to get from AppRevision first
+	if af.AppRevision != nil && af.AppRevision.Spec.PolicyDefinitions != nil {
+		if def, ok := af.AppRevision.Spec.PolicyDefinitions[policy.Type]; ok {
+			policyDef = &def
+		}
+	}
+
+	// If not in AppRevision, look it up from cluster
+	if policyDef == nil && cli != nil {
+		def := &v1beta1.PolicyDefinition{}
+		err := util.GetCapabilityDefinition(ctx, cli, def, policy.Type, af.app.Annotations)
+		if err != nil {
+			return false
+		}
+		policyDef = def
+	}
+
+	if policyDef == nil {
+		return false
+	}
+
+	return policyDef.Spec.Scope != v1beta1.DefaultScope
 }
 
 // artifacts contains resources in unstructured shape of all components
@@ -559,6 +598,19 @@ func makeWorkloadWithContext(pCtx process.Context, comp *Component, ns, appName 
 	default:
 		workload, err = base.Unstructured()
 		if err != nil {
+			// Try to get the full workload template for comprehensive error analysis
+			if fullTemplateData := pCtx.GetData(definition.GetWorkloadTemplateKey(comp.Name)); fullTemplateData != nil {
+				if fullTemplate, ok := fullTemplateData.(cue.Value); ok {
+					if formattedErr := definition.FormatCUEError(err, "cannot generate manifests from", "component", comp.Name, &fullTemplate); formattedErr != nil {
+						return nil, formattedErr
+					}
+				}
+			}
+			// Fallback to using the base's value
+			val := base.Value()
+			if formattedErr := definition.FormatCUEError(err, "cannot generate manifests from", "component", comp.Name, &val); formattedErr != nil {
+				return nil, formattedErr
+			}
 			return nil, errors.Wrapf(err, "evaluate base template component=%s app=%s", comp.Name, appName)
 		}
 	}
@@ -724,6 +776,7 @@ func GenerateContextDataFromAppFile(appfile *Appfile, wlName string) velaprocess
 		CompName:        wlName,
 		AppRevisionName: appfile.AppRevisionName,
 		Components:      appfile.Components,
+		Ctx:             appfile.Context,
 	}
 	if appfile.AppAnnotations != nil {
 		data.WorkflowName = appfile.AppAnnotations[oam.AnnotationWorkflowName]
@@ -742,7 +795,7 @@ func (af *Appfile) WorkflowClient(cli client.Client) client.Client {
 	return velaclient.DelegatingHandlerClient{
 		Client: cli,
 		Getter: func(ctx context.Context, key client.ObjectKey, obj client.Object, _ ...client.GetOption) error {
-			if wf, ok := obj.(*workflowv1alpha1.Workflow); ok {
+			if wf, ok := obj.(*wfTypesv1alpha1.Workflow); ok {
 				if af.AppRevision != nil {
 					if af.ExternalWorkflow != nil && af.ExternalWorkflow.Name == key.Name && af.ExternalWorkflow.Namespace == key.Namespace {
 						af.ExternalWorkflow.DeepCopyInto(wf)
@@ -753,7 +806,7 @@ func (af *Appfile) WorkflowClient(cli client.Client) client.Client {
 				if err := cli.Get(ctx, key, obj); err != nil {
 					return err
 				}
-				af.ExternalWorkflow = obj.(*workflowv1alpha1.Workflow)
+				af.ExternalWorkflow = obj.(*wfTypesv1alpha1.Workflow)
 				return nil
 			}
 			return cli.Get(ctx, key, obj)

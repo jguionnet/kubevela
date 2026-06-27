@@ -123,6 +123,21 @@ const (
 	// ValidateResourcesExist enables webhook validation to check if resource types referenced in
 	// ComponentDefinition/TraitDefinition/WorkflowStepDefinition/PolicyDefinition CUE templates exist in the cluster
 	ValidateResourcesExist = "ValidateResourcesExist"
+
+	// EnableGlobalPolicies enables automatic discovery of global PolicyDefinitions
+	// Controls whether policies with global: true are discovered from vela-system and namespace
+	EnableGlobalPolicies featuregate.Feature = "EnableGlobalPolicies"
+
+	// EnableApplicationScopedPolicies enables the execution of Application-scoped policies.
+	// When disabled, policies with scope: Application will not be applied (both global and explicit).
+	// This gates the core Application transform functionality. Use EnableGlobalPolicies to
+	// separately control global policy discovery.
+	EnableApplicationScopedPolicies featuregate.Feature = "EnableApplicationScopedPolicies"
+
+	// ValidateUndeclaredParameters enables validation that rejects parameters not declared in the
+	// CUE definition schema. When enabled, any parameter field not present in the template's
+	// parameter stanza will cause a validation error at admission time.
+	ValidateUndeclaredParameters = "ValidateUndeclaredParameters"
 )
 
 var defaultFeatureGates = map[featuregate.Feature]featuregate.FeatureSpec{
@@ -138,7 +153,7 @@ var defaultFeatureGates = map[featuregate.Feature]featuregate.FeatureSpec{
 	GzipResourceTracker:                           {Default: false, PreRelease: featuregate.Alpha},
 	ZstdResourceTracker:                           {Default: false, PreRelease: featuregate.Alpha},
 	ApplyOnce:                                     {Default: false, PreRelease: featuregate.Alpha},
-	MultiStageComponentApply:                      {Default: false, PreRelease: featuregate.Alpha},
+	MultiStageComponentApply:                      {Default: true, PreRelease: featuregate.Alpha},
 	GzipApplicationRevision:                       {Default: false, PreRelease: featuregate.Alpha},
 	ZstdApplicationRevision:                       {Default: false, PreRelease: featuregate.Alpha},
 	PreDispatchDryRun:                             {Default: true, PreRelease: featuregate.Alpha},
@@ -151,6 +166,9 @@ var defaultFeatureGates = map[featuregate.Feature]featuregate.FeatureSpec{
 	EnableCueValidation:                           {Default: false, PreRelease: featuregate.Beta},
 	EnableApplicationStatusMetrics:                {Default: false, PreRelease: featuregate.Alpha},
 	ValidateResourcesExist:                        {Default: false, PreRelease: featuregate.Alpha},
+	EnableGlobalPolicies:                          {Default: false, PreRelease: featuregate.Alpha},
+	EnableApplicationScopedPolicies:               {Default: false, PreRelease: featuregate.Alpha},
+	ValidateUndeclaredParameters:                  {Default: false, PreRelease: featuregate.Alpha},
 }
 
 func init() {

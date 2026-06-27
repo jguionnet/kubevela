@@ -26,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	wfTypesv1alpha1 "github.com/kubevela/pkg/apis/oam/v1alpha1"
 	workflowv1alpha1 "github.com/kubevela/workflow/api/v1alpha1"
 
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/condition"
@@ -173,12 +174,15 @@ type ApplicationComponentStatus struct {
 	Cluster   string `json:"cluster,omitempty"`
 	Env       string `json:"env,omitempty"`
 	// WorkloadDefinition is the definition of a WorkloadDefinition, such as deployments/apps.v1
-	WorkloadDefinition WorkloadGVK              `json:"workloadDefinition,omitempty"`
-	Healthy            bool                     `json:"healthy"`
-	Details            map[string]string        `json:"details,omitempty"`
-	Message            string                   `json:"message,omitempty"`
-	Traits             []ApplicationTraitStatus `json:"traits,omitempty"`
-	Scopes             []corev1.ObjectReference `json:"scopes,omitempty"`
+	WorkloadDefinition WorkloadGVK `json:"workloadDefinition,omitempty"`
+	Healthy            bool        `json:"healthy"`
+	// WorkloadHealthy indicates the workload health without considering trait health.
+	// +optional
+	WorkloadHealthy bool                     `json:"workloadHealthy,omitempty"`
+	Details         map[string]string        `json:"details,omitempty"`
+	Message         string                   `json:"message,omitempty"`
+	Traits          []ApplicationTraitStatus `json:"traits,omitempty"`
+	Scopes          []corev1.ObjectReference `json:"scopes,omitempty"`
 }
 
 // Equal check if two ApplicationComponentStatus are equal
@@ -191,6 +195,7 @@ func (in ApplicationComponentStatus) Equal(r ApplicationComponentStatus) bool {
 type ApplicationTraitStatus struct {
 	Type    string            `json:"type"`
 	Healthy bool              `json:"healthy"`
+	Pending bool              `json:"pending,omitempty"`
 	Details map[string]string `json:"details,omitempty"`
 	Message string            `json:"message,omitempty"`
 }
@@ -201,6 +206,40 @@ type Revision struct {
 	Revision int64  `json:"revision"`
 
 	// RevisionHash record the hash value of the spec of ApplicationRevision object.
+	RevisionHash string `json:"revisionHash,omitempty"`
+}
+
+// AppliedApplicationPolicy records minimal status information about an Application-scoped policy.
+// This covers both global (auto-discovered) and explicit (spec-referenced) policies.
+// Full details (transforms, labels, annotations, etc.) are stored in the ConfigMap referenced
+// by ApplicationPoliciesConfigMap for persistent storage and observability.
+type AppliedApplicationPolicy struct {
+	Name      string `json:"name"`
+	Type      string `json:"type,omitempty"`
+	Namespace string `json:"namespace"`
+	Applied   bool   `json:"applied"`
+	Error     bool   `json:"error,omitempty"`
+	Message   string `json:"message,omitempty"`
+	Source    string `json:"source,omitempty"` // "global" or "explicit" - how the policy was applied
+
+	SpecModified     bool `json:"specModified,omitempty"`
+	LabelsCount      int  `json:"labelsCount,omitempty"`
+	AnnotationsCount int  `json:"annotationsCount,omitempty"`
+	HasContext       bool `json:"hasContext,omitempty"`
+
+	// Version tracking
+	// DefinitionRevisionName is the DefinitionRevision resource name if a versioned policy was used (e.g., "my-policy-v3")
+	// Empty if the policy wasn't versioned (used latest PolicyDefinition)
+	// +optional
+	DefinitionRevisionName string `json:"definitionRevisionName,omitempty"`
+
+	// Revision is the revision number from the DefinitionRevision (e.g. 3)
+	// +optional
+	Revision int64 `json:"revision,omitempty"`
+
+	// RevisionHash is the hash of the PolicyDefinition template from the DefinitionRevision
+	// This is the definitive proof of exactly what template was used
+	// +optional
 	RevisionHash string `json:"revisionHash,omitempty"`
 }
 
@@ -225,12 +264,28 @@ type AppStatus struct {
 	// Workflow record the status of workflow
 	Workflow *WorkflowStatus `json:"workflow,omitempty"`
 
+	// WorkflowRestartScheduledAt schedules a workflow restart at the specified time.
+	// This field is automatically set when the app.oam.dev/restart-workflow annotation is present,
+	// and is cleared after the restart is triggered. Use RFC3339 format or set to current time for immediate restart.
+	// +optional
+	WorkflowRestartScheduledAt *metav1.Time `json:"workflowRestartScheduledAt,omitempty"`
+
 	// LatestRevision of the application configuration it generates
 	// +optional
 	LatestRevision *Revision `json:"latestRevision,omitempty"`
 
 	// AppliedResources record the resources that the  workflow step apply.
 	AppliedResources []ClusterObjectReference `json:"appliedResources,omitempty"`
+
+	// AppliedApplicationPolicies lists Application-scoped policies (both global and explicit)
+	// that were discovered and applied (or skipped) during reconciliation.
+	// +optional
+	AppliedApplicationPolicies []AppliedApplicationPolicy `json:"appliedApplicationPolicies,omitempty"`
+
+	// ApplicationPoliciesConfigMap references the ConfigMap containing rendered policy outputs
+	// Format: "application-policies-{namespace}-{name}"
+	// +optional
+	ApplicationPoliciesConfigMap string `json:"applicationPoliciesConfigMap,omitempty"`
 
 	// PolicyStatus records the status of policy
 	// Deprecated This field is only used by EnvBinding Policy which is deprecated.
@@ -301,9 +356,9 @@ type ApplicationComponent struct {
 	// +kubebuilder:pruning:PreserveUnknownFields
 	Properties *runtime.RawExtension `json:"properties,omitempty"`
 
-	DependsOn []string                     `json:"dependsOn,omitempty"`
-	Inputs    workflowv1alpha1.StepInputs  `json:"inputs,omitempty"`
-	Outputs   workflowv1alpha1.StepOutputs `json:"outputs,omitempty"`
+	DependsOn []string                    `json:"dependsOn,omitempty"`
+	Inputs    wfTypesv1alpha1.StepInputs  `json:"inputs,omitempty"`
+	Outputs   wfTypesv1alpha1.StepOutputs `json:"outputs,omitempty"`
 
 	// Traits define the trait of one component, the type must be array to keep the order.
 	Traits []ApplicationTrait `json:"traits,omitempty"`

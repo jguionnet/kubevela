@@ -29,8 +29,8 @@ import (
 
 	"cuelang.org/go/cue"
 	"cuelang.org/go/cue/ast"
-	"cuelang.org/go/cue/cuecontext"
 	"github.com/getkin/kin-openapi/openapi3"
+	"github.com/kubevela/pkg/cue/cuex"
 	"github.com/olekukonko/tablewriter"
 	"github.com/pkg/errors"
 	"golang.org/x/mod/modfile"
@@ -126,19 +126,23 @@ func (ref *ParseReference) formatTableString(s string) string {
 func (ref *ParseReference) prepareConsoleParameter(tableName string, parameterList []ReferenceParameter, category types.CapabilityCategory) ConsoleReference {
 	table := tablewriter.NewWriter(os.Stdout)
 	table.SetColWidth(100)
-	table.SetHeader([]string{ref.I18N.Get("Name"), ref.I18N.Get("Description"), ref.I18N.Get("Type"), ref.I18N.Get("Required"), ref.I18N.Get("Default")})
+	table.SetHeader([]string{ref.I18N.Get("Name"), ref.I18N.Get("Description"), ref.I18N.Get("Type"), ref.I18N.Get("Required"), ref.I18N.Get("Default"), ref.I18N.Get("Immutable")})
 	switch category {
 	case types.CUECategory:
 		for _, p := range parameterList {
 			if !p.Ignore {
 				printableDefaultValue := ref.getCUEPrintableDefaultValue(p.Default)
-				table.Append([]string{ref.I18N.Get(p.Name), ref.prettySentence(p.Usage), ref.I18N.Get(p.PrintableType), ref.I18N.Get(strconv.FormatBool(p.Required)), ref.I18N.Get(printableDefaultValue)})
+				immutableVal := ""
+				if p.Immutable {
+					immutableVal = "true"
+				}
+				table.Append([]string{ref.I18N.Get(p.Name), ref.prettySentence(p.Usage), ref.I18N.Get(p.PrintableType), ref.I18N.Get(strconv.FormatBool(p.Required)), ref.I18N.Get(printableDefaultValue), immutableVal})
 			}
 		}
 	case types.TerraformCategory:
 		// Terraform doesn't have default value
 		for _, p := range parameterList {
-			table.Append([]string{ref.I18N.Get(p.Name), ref.prettySentence(p.Usage), ref.I18N.Get(p.PrintableType), ref.I18N.Get(strconv.FormatBool(p.Required)), ""})
+			table.Append([]string{ref.I18N.Get(p.Name), ref.prettySentence(p.Usage), ref.I18N.Get(p.PrintableType), ref.I18N.Get(strconv.FormatBool(p.Required)), "", ""})
 		}
 	default:
 	}
@@ -250,7 +254,7 @@ func (ref *ParseReference) parseParameters(capName string, paraValue cue.Value, 
 				param.Default = velacue.GetDefault(def)
 			}
 			param.Required = !fi.IsOptional && (param.Default == nil)
-			param.Short, param.Usage, param.Alias, param.Ignore = velacue.RetrieveComments(val)
+			param.Short, param.Usage, param.Alias, param.Ignore, param.Immutable = velacue.RetrieveComments(val)
 			param.Type = val.IncompleteKind()
 			switch val.IncompleteKind() {
 			case cue.StructKind:
@@ -699,8 +703,15 @@ func WalkParameterSchema(parameters *openapi3.Schema, name string, depth int) er
 }
 
 // GetBaseResourceKinds helps get resource.group string of components' base resource
-func GetBaseResourceKinds(cueStr string, mapper meta.RESTMapper) (string, error) {
-	tmpl := cuecontext.New().CompileString(cueStr + velacue.BaseTemplate)
+func GetBaseResourceKinds(ctx context.Context, cueStr string, mapper meta.RESTMapper) (string, error) {
+	tmpl, err := cuex.DefaultCompiler.Get().CompileStringWithOptions(
+		ctx,
+		cueStr+velacue.BaseTemplate,
+		cuex.DisableResolveProviderFunctions{},
+	)
+	if err != nil {
+		return "", err
+	}
 	kindValue := tmpl.LookupPath(cue.ParsePath("output.kind"))
 	kind, err := kindValue.String()
 	if err != nil {

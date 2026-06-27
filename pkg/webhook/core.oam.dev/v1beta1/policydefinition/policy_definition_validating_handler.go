@@ -29,6 +29,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1beta1"
+	applicationcontroller "github.com/oam-dev/kubevela/pkg/controller/core.oam.dev/v1beta1/application"
+	"github.com/oam-dev/kubevela/pkg/cue/upgrade"
 	"github.com/oam-dev/kubevela/pkg/logging"
 	"github.com/oam-dev/kubevela/pkg/oam"
 	webhookutils "github.com/oam-dev/kubevela/pkg/webhook/utils"
@@ -64,6 +66,7 @@ func (h *ValidatingHandler) Handle(ctx context.Context, req admission.Request) a
 	}
 
 	if req.Operation == admissionv1.Create || req.Operation == admissionv1.Update {
+		var cueWarnings []string
 		if err := h.Decoder.Decode(req, obj); err != nil {
 			logger.WithStep("decode").WithError(err).Error(err, "Unable to decode admission request payload into PolicyDefinition object - malformed request")
 			return admission.Errored(http.StatusBadRequest, fmt.Errorf("%s (requestUID=%s)", err.Error(), req.UID))
@@ -79,11 +82,22 @@ func (h *ValidatingHandler) Handle(ctx context.Context, req admission.Request) a
 
 		if obj.Spec.Schematic != nil && obj.Spec.Schematic.CUE != nil {
 			logger.WithStep("validate-cue").Info("Validating CUE template syntax and semantics for PolicyDefinition schematic")
-			if err := webhookutils.ValidateCueTemplate(obj.Spec.Schematic.CUE.Template); err != nil {
+
+			// Validate against the effective template; with auto-upgrade is enabled
+			cueTemplate := obj.Spec.Schematic.CUE.Template
+			if upgrade.EnableCUEVersionCompatibility {
+				upgraded, wasUpgraded := upgrade.EnsureCueVersionCompatibility(cueTemplate, obj.Name, upgrade.PolicyKind, upgrade.TemplateAreaMain)
+				if wasUpgraded {
+					cueWarnings = append(cueWarnings, "CUE template uses legacy syntax that will be auto-upgraded at render time. Run `vela def compat definitions` to scan all definitions for legacy syntax.")
+					cueTemplate = upgraded
+				}
+			}
+
+			if err := webhookutils.ValidateCueTemplate(cueTemplate); err != nil {
 				logger.WithStep("validate-cue").WithError(err).Error(err, "CUE template contains syntax errors or invalid constructs - template compilation failed")
 				return admission.Denied(fmt.Sprintf("%s (requestUID=%s)", err.Error(), req.UID))
 			}
-			if err := webhookutils.ValidateOutputResourcesExist(obj.Spec.Schematic.CUE.Template, h.Client.RESTMapper(), obj); err != nil {
+			if err := webhookutils.ValidateOutputResourcesExist(cueTemplate, h.Client.RESTMapper(), obj); err != nil {
 				logger.WithStep("validate-output-resources").WithError(err).Error(err, "CUE template references output resources that don't exist in cluster - unknown resource types detected")
 				return admission.Denied(fmt.Sprintf("%s (requestUID=%s)", err.Error(), req.UID))
 			}
@@ -112,7 +126,19 @@ func (h *ValidatingHandler) Handle(ctx context.Context, req admission.Request) a
 			logger.WithStep("validate-version-conflict").WithError(err).Error(err, "PolicyDefinition has conflicting version specifications - cannot have both spec.version and revision annotation", "specVersion", obj.Spec.Version, "revisionName", revisionName)
 			return admission.Denied(fmt.Sprintf("%s (requestUID=%s)", err.Error(), req.UID))
 		}
+
+		// Validate Application-scoped policy constraints (global=true rules, scope consistency)
+		validationResult := applicationcontroller.ValidatePolicyDefinition(obj)
+		validationResult.Warnings = append(validationResult.Warnings, cueWarnings...)
+		if !validationResult.IsValid() {
+			logger.WithStep("validate-policy-definition").Error(nil, "PolicyDefinition failed Application-scoped policy validation", "errors", validationResult.Errors)
+			return admission.Denied(fmt.Sprintf("invalid PolicyDefinition: %v (requestUID=%s)", validationResult.Errors, req.UID))
+		}
+
 		logger.WithStep("complete").WithSuccess(true, startTime).Info("PolicyDefinition admission validation completed successfully - resource is valid and will be admitted", "definitionName", obj.Name, "operation", req.Operation)
+		if len(validationResult.Warnings) > 0 {
+			return admission.ValidationResponse(true, "").WithWarnings(validationResult.Warnings...)
+		}
 	} else {
 		logger.WithStep("skip-validation").Info("Skipping PolicyDefinition validation - operation does not require validation", "operation", req.Operation, "reason", "only CREATE and UPDATE operations are validated")
 	}

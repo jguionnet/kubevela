@@ -14,15 +14,15 @@ spec:
   schematic:
     cue:
       template: |
-        import "vela/metrics"
-        import "vela/builtin"
-
+        import (
+        	"vela/metrics"
+        	"vela/builtin"
+        )
         check: metrics.#PromCheck & {
         	$params: {
         		query:          parameter.query
         		metricEndpoint: parameter.metricEndpoint
         		condition:      parameter.condition
-        		stepID:         context.stepSessionID
         		duration:       parameter.duration
         		failDuration:   parameter.failDuration
         	}

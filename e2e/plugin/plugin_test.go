@@ -566,7 +566,7 @@ spec:
 `
 
 var dryRunResult = `---
-# Application(test-vela-app) -- Component(express-server) 
+# Application(test-vela-app) -- Component(express-server)
 ---
 
 apiVersion: apps/v1
@@ -598,7 +598,7 @@ spec:
         - containerPort: 80
 
 ---
-## From the trait test-ingress 
+## From the trait test-ingress
 apiVersion: v1
 kind: Service
 metadata:
@@ -621,7 +621,7 @@ spec:
     app.oam.dev/component: express-server
 
 ---
-## From the trait test-ingress 
+## From the trait test-ingress
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -907,26 +907,26 @@ spec:
 `
 
 var showCdResult = `# Specification
-+---------+--------------------------------------------------------------------------------------------------+----------+----------+---------+
-|  NAME   |                                           DESCRIPTION                                            |   TYPE   | REQUIRED | DEFAULT |
-+---------+--------------------------------------------------------------------------------------------------+----------+----------+---------+
-| count   | specify number of tasks to run in parallel.                                                      | int      | false    |       1 |
-| image   | Which image would you like to use for your service.                                              | string   | true     |         |
-| restart | Define the job restart policy, the value can only be Never or OnFailure. By default, it's Never. | string   | false    | Never   |
-| cmd     | Commands to run in the container.                                                                | []string | false    |         |
-+---------+--------------------------------------------------------------------------------------------------+----------+----------+---------+
++---------+--------------------------------------------------------------------------------------------------+----------+----------+---------+-----------+
+|  NAME   |                                           DESCRIPTION                                            |   TYPE   | REQUIRED | DEFAULT | IMMUTABLE |
++---------+--------------------------------------------------------------------------------------------------+----------+----------+---------+-----------+
+| count   | specify number of tasks to run in parallel.                                                      | int      | false    |       1 |           |
+| image   | Which image would you like to use for your service.                                              | string   | true     |         |           |
+| restart | Define the job restart policy, the value can only be Never or OnFailure. By default, it's Never. | string   | false    | Never   |           |
+| cmd     | Commands to run in the container.                                                                | []string | false    |         |           |
++---------+--------------------------------------------------------------------------------------------------+----------+----------+---------+-----------+
 
 
 `
 
 var showTdResult = `# Specification
-+---------+-------------+----------+----------+---------+
-|  NAME   | DESCRIPTION |   TYPE   | REQUIRED | DEFAULT |
-+---------+-------------+----------+----------+---------+
-| name    |             | string   | true     |         |
-| image   |             | string   | true     |         |
-| command |             | []string | false    |         |
-+---------+-------------+----------+----------+---------+
++---------+-------------+----------+----------+---------+-----------+
+|  NAME   | DESCRIPTION |   TYPE   | REQUIRED | DEFAULT | IMMUTABLE |
++---------+-------------+----------+----------+---------+-----------+
+| name    |             | string   | true     |         |           |
+| image   |             | string   | true     |         |           |
+| command |             | []string | false    |         |           |
++---------+-------------+----------+----------+---------+-----------+
 
 
 `

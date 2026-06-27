@@ -110,7 +110,7 @@ func run(ctx context.Context, coreOptions *options.CoreOptions) error {
 
 	// Sync configurations
 	klog.V(2).InfoS("Syncing configurations to global variables")
-	syncConfigurations(coreOptions)
+	syncConfigurations(ctx, coreOptions)
 	klog.InfoS("Configuration sync completed successfully")
 
 	// Setup logging
@@ -200,14 +200,14 @@ func run(ctx context.Context, coreOptions *options.CoreOptions) error {
 }
 
 // syncConfigurations syncs parsed config values to external package global variables
-func syncConfigurations(coreOptions *options.CoreOptions) {
+func syncConfigurations(ctx context.Context, coreOptions *options.CoreOptions) {
 	if coreOptions.Workflow != nil {
 		klog.V(3).InfoS("Syncing workflow configuration")
 		coreOptions.Workflow.SyncToWorkflowGlobals()
 	}
 	if coreOptions.CUE != nil {
 		klog.V(3).InfoS("Syncing CUE configuration")
-		coreOptions.CUE.SyncToCUEGlobals()
+		coreOptions.CUE.SyncToCUEGlobals(ctx)
 	}
 	if coreOptions.Application != nil {
 		klog.V(3).InfoS("Syncing application configuration")
@@ -451,6 +451,10 @@ func prepareRunInShardingMode(ctx context.Context, manager manager.Manager, core
 // - Runs pre-start validation hooks to ensure system readiness
 // This function is used in single-instance mode or by the master shard in sharding mode.
 func prepareRun(ctx context.Context, manager manager.Manager, coreOptions *options.CoreOptions) error {
+	// Bootstrap provider registry early before other initialization
+	klog.V(2).InfoS("Initializing provider registry")
+	bootstrapProviderRegistry()
+
 	if coreOptions.Webhook.UseWebhook {
 		klog.InfoS("Webhook enabled, registering OAM webhooks",
 			"port", coreOptions.Webhook.WebhookPort,

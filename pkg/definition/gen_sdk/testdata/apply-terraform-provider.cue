@@ -1,6 +1,7 @@
 import (
-	"vela/op"
-	"strings"
+	"vela/config"
+	"vela/kube"
+	"vela/builtin"
 )
 
 "apply-terraform-provider": {
@@ -15,7 +16,7 @@ import (
 }
 
 template: {
-	config: op.#CreateConfig & {
+	cfg: config.#CreateConfig & {
 		name:      "\(context.name)-\(context.stepName)"
 		namespace: context.namespace
 		template:  "terraform-\(parameter.type)"
@@ -64,7 +65,7 @@ template: {
 			}
 		}
 	}
-	read: op.#Read & {
+	read: kube.#Read & {
 		value: {
 			apiVersion: "terraform.core.oam.dev/v1beta1"
 			kind:       "Provider"
@@ -74,12 +75,9 @@ template: {
 			}
 		}
 	}
-	check: op.#ConditionalWait & {
-		if read.value.status != _|_ {
-			continue: read.value.status.state == "ready"
-		}
-		if read.value.status == _|_ {
-			continue: false
+	check: builtin.#ConditionalWait & {
+		if read.$returns.value.status != _|_ {
+			$params: continue: read.$returns.value.status.state == "ready"
 		}
 	}
 	providerBasic: {

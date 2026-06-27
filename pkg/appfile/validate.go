@@ -17,16 +17,31 @@ limitations under the License.
 package appfile
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"cuelang.org/go/cue"
 	"github.com/jeremywohl/flatten/v2"
-	"github.com/kubevela/pkg/cue/cuex"
 	"github.com/kubevela/workflow/pkg/cue/model/value"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/klog/v2"
 
+	"github.com/oam-dev/kubevela/apis/core.oam.dev/v1beta1"
+
+	cueutils "github.com/oam-dev/kubevela/pkg/cue"
+	// Use WorkloadCompiler instead of the upstream cuex.DefaultCompiler.
+	// The upstream DefaultCompiler does not include provider packages like
+	// "vela/helm". Component templates (e.g., helmchart) import these packages,
+	// so CUE compilation fails with "field not found: parameter" when validated
+	// against a compiler that lacks them. WorkloadCompiler includes both upstream
+	// packages (base64, http, kube, cueext) and local provider packages (helm,
+	// config) and is initialized lazily (no init-time kubeconfig dependency).
+	velacuex "github.com/oam-dev/kubevela/pkg/cue/cuex"
+	"github.com/oam-dev/kubevela/pkg/cue/cuex/providers/helm"
+	"github.com/oam-dev/kubevela/pkg/cue/upgrade"
 	"github.com/oam-dev/kubevela/pkg/features"
 
 	"github.com/pkg/errors"
@@ -48,6 +63,13 @@ func (p *Parser) ValidateCUESchematicAppfile(a *Appfile) error {
 		}
 
 		ctxData := GenerateContextDataFromAppFile(a, wl.Name)
+		// Set dry-run mode so provider functions (e.g., helm.#Render) perform
+		// client-only rendering instead of real cluster installs during validation.
+		if ctxData.Ctx == nil {
+			ctxData.Ctx = context.Background()
+		}
+		ctxData.Ctx = helm.WithDryRun(ctxData.Ctx)
+
 		if utilfeature.DefaultMutableFeatureGate.Enabled(features.EnableCueValidation) {
 			err := p.ValidateComponentParams(ctxData, wl, a)
 			if err != nil {
@@ -55,13 +77,36 @@ func (p *Parser) ValidateCUESchematicAppfile(a *Appfile) error {
 			}
 		}
 
+		// Collect workflow-supplied params for this component upfront
+		workflowParams := getWorkflowAndPolicySuppliedParams(a)
+
+		// Only augment if component has traits AND workflow supplies params (issue 7022)
+		originalParams := wl.Params
+		if len(wl.Traits) > 0 && len(workflowParams) > 0 {
+			shouldSkip, augmented := p.augmentComponentParamsForValidation(wl, workflowParams, ctxData)
+			if shouldSkip {
+				// Component has complex validation that can't be handled, skip trait validation
+				fmt.Printf("INFO: Skipping trait validation for component %q due to workflow-supplied parameters with complex validation\n", wl.Name)
+				continue
+			}
+			wl.Params = augmented
+		}
+
 		pCtx, err := newValidationProcessContext(wl, ctxData)
+		wl.Params = originalParams // Restore immediately
+
 		if err != nil {
 			return errors.WithMessagef(err, "cannot create the validation process context of app=%s in namespace=%s", a.Name, a.Namespace)
 		}
 
 		for _, tr := range wl.Traits {
 			if tr.CapabilityCategory != types.CUECategory {
+				continue
+			}
+			if tr.FullTemplate != nil &&
+				tr.FullTemplate.TraitDefinition.Spec.Stage == v1beta1.PostDispatch {
+				// PostDispatch type trait validation at this point might fail as they could have
+				// references to fields that are populated/injected during runtime only
 				continue
 			}
 			if err := tr.EvalContext(pCtx); err != nil {
@@ -98,13 +143,16 @@ func (p *Parser) ValidateComponentParams(ctxData velaprocess.ContextData, wl *Co
 		return errors.WithMessagef(err, "component %q: invalid params", wl.Name)
 	}
 
+	// Apply the cue compatibility upgrades so that the render path applies
+	templateStr, _ := upgrade.EnsureCueVersionCompatibility(wl.FullTemplate.TemplateStr, wl.Name, upgrade.ComponentKind, upgrade.TemplateAreaMain)
+
 	cueSrc := strings.Join([]string{
-		renderTemplate(wl.FullTemplate.TemplateStr),
+		renderTemplate(templateStr),
 		paramSnippet,
 		baseCtx,
 	}, "\n")
 
-	val, err := cuex.DefaultCompiler.Get().CompileString(ctx.GetCtx(), cueSrc)
+	val, err := velacuex.WorkloadCompiler.Get().CompileString(ctx.GetCtx(), cueSrc)
 	if err != nil {
 		return errors.WithMessagef(err, "component %q: CUE compile error", wl.Name)
 	}
@@ -124,7 +172,140 @@ func (p *Parser) ValidateComponentParams(ctxData velaprocess.ContextData, wl *Co
 		return errors.WithMessagef(err, "component %q: parameter constraint violation", wl.Name)
 	}
 
+	// ---------------------------------------------------------------------
+	// 4. Reject undeclared parameters (feature-gated)
+	// ---------------------------------------------------------------------
+	if utilfeature.DefaultMutableFeatureGate.Enabled(features.ValidateUndeclaredParameters) {
+		// Compile the template WITHOUT user params to get the pure schema.
+		schemaSrc := strings.Join([]string{
+			renderTemplate(templateStr),
+			baseCtx,
+		}, "\n")
+		schemaRoot, schemaErr := velacuex.WorkloadCompiler.Get().CompileString(ctx.GetCtx(), schemaSrc)
+		if schemaErr != nil {
+			klog.V(4).Infof("component %q: skipping undeclared parameter check: schema compilation failed: %v", wl.Name, schemaErr)
+		} else {
+			paramSchema := schemaRoot.LookupPath(value.FieldPath(velaprocess.ParameterFieldName))
+			undeclared := findUndeclaredFields(paramSchema, wl.Params, "")
+
+			// Second pass: resolve conditional parameter declarations by
+			// re-compiling with only the base-declared params so CUE
+			// conditionals (e.g. if mode == "x" { field?: T }) evaluate.
+			if len(undeclared) > 0 {
+				baseDeclared := getDeclaredFieldNames(paramSchema)
+				if len(baseDeclared) > 0 {
+					filteredParams := make(map[string]any)
+					for k, v := range wl.Params {
+						if baseDeclared[k] {
+							filteredParams[k] = v
+						}
+					}
+					condSnippet, fErr := cueParamBlock(filteredParams)
+					if fErr == nil {
+						condSrc := strings.Join([]string{
+							renderTemplate(templateStr),
+							condSnippet,
+							baseCtx,
+						}, "\n")
+						condRoot, condErr := velacuex.WorkloadCompiler.Get().CompileString(ctx.GetCtx(), condSrc)
+						if condErr == nil {
+							condSchema := condRoot.LookupPath(value.FieldPath(velaprocess.ParameterFieldName))
+							undeclared = findUndeclaredFields(condSchema, wl.Params, "")
+						}
+					}
+				}
+			}
+
+			if len(undeclared) > 0 {
+				sort.Strings(undeclared)
+				return errors.WithMessagef(
+					fmt.Errorf("undeclared parameters: %s", strings.Join(undeclared, ",")),
+					"component %q", wl.Name)
+			}
+		}
+	}
+
 	return nil
+}
+
+// checkUndeclaredParams verifies that every key in params is declared in the
+// CUE parameter schema. Returns an error listing any undeclared field paths.
+func checkUndeclaredParams(schema cue.Value, params map[string]any) error {
+	if len(params) == 0 {
+		return nil
+	}
+	undeclared := findUndeclaredFields(schema, params, "")
+	if len(undeclared) > 0 {
+		sort.Strings(undeclared)
+		return fmt.Errorf("undeclared parameters: %s", strings.Join(undeclared, ","))
+	}
+	return nil
+}
+
+// findUndeclaredFields recursively walks the user-provided params and collects
+// field paths that are not declared in the CUE schema (including optional fields).
+func findUndeclaredFields(schema cue.Value, params map[string]any, prefix string) []string {
+	// If the schema has a pattern constraint ([string]: T), all string-keyed
+	// fields are valid at this level (e.g., labels?: [string]: string).
+	if schema.LookupPath(cue.MakePath(cue.AnyString)).Exists() {
+		return nil
+	}
+
+	// Collect declared field names from the schema (required + optional).
+	declared := make(map[string]cue.Value)
+	it, err := schema.Fields(cue.Optional(true), cue.Definitions(false), cue.Hidden(false))
+	if err != nil {
+		// Cannot enumerate schema fields; skip undeclared check at this level
+		// to avoid false positives when field iteration fails.
+		return nil
+	}
+	for it.Next() {
+		declared[cueutils.GetSelectorLabel(it.Selector())] = it.Value()
+	}
+
+	var undeclared []string
+	for key, val := range params {
+		path := key
+		if prefix != "" {
+			path = prefix + "." + key
+		}
+		fieldSchema, ok := declared[key]
+		if !ok {
+			undeclared = append(undeclared, path)
+			continue
+		}
+		// Recurse into nested structs.
+		if nested, isMap := val.(map[string]any); isMap && fieldSchema.IncompleteKind() == cue.StructKind {
+			undeclared = append(undeclared, findUndeclaredFields(fieldSchema, nested, path)...)
+		}
+		// Recurse into list elements that contain structs.
+		if items, isList := val.([]any); isList && fieldSchema.IncompleteKind() == cue.ListKind {
+			elemSchema := fieldSchema.LookupPath(cue.MakePath(cue.AnyIndex))
+			if elemSchema.Exists() && elemSchema.IncompleteKind() == cue.StructKind {
+				for i, item := range items {
+					if nested, isMap := item.(map[string]any); isMap {
+						elemPath := fmt.Sprintf("%s[%d]", path, i)
+						undeclared = append(undeclared, findUndeclaredFields(elemSchema, nested, elemPath)...)
+					}
+				}
+			}
+		}
+	}
+	return undeclared
+}
+
+// getDeclaredFieldNames returns the set of top-level field names declared in
+// the CUE schema (including optional fields).
+func getDeclaredFieldNames(schema cue.Value) map[string]bool {
+	declared := make(map[string]bool)
+	it, err := schema.Fields(cue.Optional(true), cue.Definitions(false), cue.Hidden(false))
+	if err != nil {
+		return declared
+	}
+	for it.Next() {
+		declared[cueutils.GetSelectorLabel(it.Selector())] = true
+	}
+	return declared
 }
 
 // cueParamBlock marshals the Params map into a `parameter:` block suitable
@@ -302,6 +483,9 @@ func newValidationProcessContext(c *Component, ctxData velaprocess.ContextData) 
 
 	ctxData.BaseHooks = baseHooks
 	ctxData.AuxiliaryHooks = auxiliaryHooks
+
+	// Dry-run mode is already set on ctxData.Ctx by the caller
+	// (ValidateCUESchematicAppfile) so provider functions use client-only rendering.
 	pCtx := velaprocess.NewContext(ctxData)
 	if err := c.EvalContext(pCtx); err != nil {
 		return nil, errors.Wrapf(err, "evaluate base template app=%s in namespace=%s", ctxData.AppName, ctxData.Namespace)
@@ -328,4 +512,202 @@ func validateAuxiliaryNameUnique() process.AuxiliaryHook {
 		}
 		return nil
 	})
+}
+
+// getWorkflowAndPolicySuppliedParams returns a set of parameter keys that will be
+// supplied by workflow steps or override policies at runtime.
+func getWorkflowAndPolicySuppliedParams(app *Appfile) map[string]bool {
+	result := make(map[string]bool)
+
+	// Collect from workflow step inputs
+	for _, step := range app.WorkflowSteps {
+		for _, in := range step.Inputs {
+			result[in.ParameterKey] = true
+		}
+	}
+
+	// Collect from override policies
+	for _, p := range app.Policies {
+		if p.Type != "override" {
+			continue
+		}
+
+		var spec overrideSpec
+		if err := json.Unmarshal(p.Properties.Raw, &spec); err != nil {
+			continue // Skip if we can't parse
+		}
+
+		for _, c := range spec.Components {
+			if len(c.Properties) == 0 {
+				continue
+			}
+
+			flat, err := flatten.Flatten(c.Properties, "", flatten.DotStyle)
+			if err != nil {
+				continue // Skip if we can't flatten
+			}
+
+			for k := range flat {
+				result[k] = true
+			}
+		}
+	}
+
+	return result
+}
+
+// getDefaultForMissingParameter checks if a parameter can be defaulted for validation
+// and returns an appropriate placeholder value.
+func getDefaultForMissingParameter(v cue.Value) (bool, any) {
+	if v.IsConcrete() {
+		return true, nil
+	}
+
+	if defaultVal, hasDefault := v.Default(); hasDefault {
+		return true, defaultVal
+	}
+
+	// Use Expr() to inspect the operation tree for complex validation
+	op, args := v.Expr()
+
+	switch op {
+	case cue.NoOp, cue.SelectorOp:
+		// No operation or field selector - simple type
+		// Use IncompleteKind for non-concrete values to get the correct type
+		return true, getTypeDefault(v.IncompleteKind())
+
+	case cue.AndOp:
+		// Conjunction (e.g., int & >0 & <100)
+		if len(args) > 1 {
+			// Check if any arg is NOT just a basic kind (indicates complex validation)
+			for _, arg := range args {
+				if arg.Kind() == cue.BottomKind {
+					return false, nil
+				}
+			}
+		}
+		return true, getTypeDefault(v.IncompleteKind())
+
+	case cue.OrOp:
+		// Disjunction (e.g., "value1" | "value2" | "value3") - likely an enum
+		if len(args) > 0 {
+			firstVal := args[0]
+			if firstVal.IsConcrete() {
+				var result any
+				if err := firstVal.Decode(&result); err == nil {
+					return true, result
+				}
+			}
+		}
+		return false, nil
+
+	default:
+		return false, nil
+	}
+}
+
+// getTypeDefault returns a simple default value based on the CUE Kind.
+func getTypeDefault(kind cue.Kind) any {
+	switch kind {
+	case cue.StringKind:
+		return "__workflow_supplied__"
+	case cue.FloatKind:
+		return 0.0
+	case cue.IntKind, cue.NumberKind:
+		return 0
+	case cue.BoolKind:
+		return false
+	case cue.ListKind:
+		return []any{}
+	case cue.StructKind:
+		return map[string]any{}
+	default:
+		return "__workflow_supplied__"
+	}
+}
+
+// augmentComponentParamsForValidation checks if workflow-supplied parameters
+// need to be augmented for trait validation. Returns (shouldSkip, augmentedParams).
+// If shouldSkip=true, the component has complex validation and should skip trait validation.
+// If shouldSkip=false, augmentedParams contains the original params plus simple defaults.
+func (p *Parser) augmentComponentParamsForValidation(wl *Component, workflowParams map[string]bool, ctxData velaprocess.ContextData) (bool, map[string]any) {
+	// Build CUE value to inspect the component's parameter schema
+	ctx := velaprocess.NewContext(ctxData)
+	baseCtx, err := ctx.BaseContextFile()
+	if err != nil {
+		return false, wl.Params // Can't inspect, proceed normally
+	}
+
+	paramSnippet, err := cueParamBlock(wl.Params)
+	if err != nil {
+		return false, wl.Params
+	}
+
+	templateStr, _ := upgrade.EnsureCueVersionCompatibility(wl.FullTemplate.TemplateStr, wl.Name, upgrade.ComponentKind, upgrade.TemplateAreaMain)
+	cueSrc := strings.Join([]string{
+		renderTemplate(templateStr),
+		paramSnippet,
+		baseCtx,
+	}, "\n")
+
+	val, err := velacuex.WorkloadCompiler.Get().CompileString(ctx.GetCtx(), cueSrc)
+	if err != nil {
+		return false, wl.Params // Can't compile, proceed normally
+	}
+
+	// Get the parameter schema
+	paramVal := val.LookupPath(value.FieldPath(velaprocess.ParameterFieldName))
+
+	// Collect default values for workflow-supplied params that are missing
+	workflowParamDefaults := make(map[string]any)
+
+	for paramKey := range workflowParams {
+		// Skip if already provided
+		if _, exists := wl.Params[paramKey]; exists {
+			continue
+		}
+
+		// Check the field in the schema
+		fieldVal := paramVal.LookupPath(cue.ParsePath(paramKey))
+		if !fieldVal.Exists() {
+			continue // Not a parameter field
+		}
+
+		canDefault, defaultVal := getDefaultForMissingParameter(fieldVal)
+		if !canDefault {
+			// complex validation - skip
+			return true, nil
+		}
+
+		if defaultVal != nil {
+			workflowParamDefaults[paramKey] = defaultVal
+		}
+	}
+
+	if len(workflowParamDefaults) == 0 {
+		return false, wl.Params
+	}
+
+	// Create augmented params map
+	augmented := make(map[string]any)
+	for k, v := range wl.Params {
+		augmented[k] = v
+	}
+	for k, v := range workflowParamDefaults {
+		augmented[k] = v
+	}
+
+	fmt.Printf("INFO: Augmented component %q with workflow-supplied defaults for trait validation: %v\n",
+		wl.Name, getMapKeys(workflowParamDefaults))
+
+	return false, augmented
+}
+
+// getMapKeys returns the keys from a map as a slice
+func getMapKeys(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }

@@ -100,6 +100,36 @@ func TestCheckHealth(t *testing.T) {
 	}
 }
 
+func TestCheckHealthErrors(t *testing.T) {
+	t.Run("empty template should return healthy", func(t *testing.T) {
+		healthy, err := CheckHealth(map[string]interface{}{}, "", nil)
+		assert.NoError(t, err)
+		assert.True(t, healthy)
+	})
+
+	t.Run("CUE compilation error should return false", func(t *testing.T) {
+		tpContext := map[string]interface{}{
+			"output": map[string]interface{}{},
+		}
+		// Invalid CUE syntax
+		healthy, err := CheckHealth(tpContext, "isHealth: {invalid cue", nil)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "compile health template")
+		assert.False(t, healthy)
+	})
+
+	t.Run("missing isHealth field should return error", func(t *testing.T) {
+		tpContext := map[string]interface{}{
+			"output": map[string]interface{}{},
+		}
+		// Valid CUE but no isHealth field
+		healthy, err := CheckHealth(tpContext, `someOtherField: true`, nil)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "evaluate health status")
+		assert.False(t, healthy)
+	})
+}
+
 func TestGetStatusMessage(t *testing.T) {
 	cases := map[string]struct {
 		tpContext  map[string]interface{}
@@ -327,6 +357,19 @@ func TestGetStatus(t *testing.T) {
 			`),
 			expStatus: map[string]string{
 				"sum": "4",
+			},
+		},
+		"test-status-with-import-statement": {
+			tpContext: map[string]interface{}{
+				"output": map[string]interface{}{},
+			},
+			parameter: make(map[string]interface{}),
+			statusCue: strings.TrimSpace(`
+				import "strings"
+				"my.details": strings.Join(["foo", "bar"], ",")
+			`),
+			expStatus: map[string]string{
+				"my.details": "foo,bar",
 			},
 		},
 		"test-key-input-too-large-skipped": {
@@ -778,6 +821,48 @@ func TestContextPassing(t *testing.T) {
 			if tc.validateCtx != nil {
 				tc.validateCtx(t, ctx)
 			}
+		})
+	}
+}
+
+func TestGetStatusWithDynamicKeys(t *testing.T) {
+	cases := map[string]struct {
+		tpContext map[string]interface{}
+		parameter interface{}
+		statusCue string
+		expStatus map[string]string
+	}{
+		"root-comprehension-generates-dynamic-keys-from-list": {
+			tpContext: map[string]interface{}{
+				"outputs": map[string]interface{}{
+					"ingress": map[string]interface{}{
+						"spec": map[string]interface{}{
+							"rules": []interface{}{
+								map[string]interface{}{"host": "foo.example.com"},
+								map[string]interface{}{"host": "bar.example.com"},
+							},
+						},
+					},
+				},
+			},
+			parameter: make(map[string]interface{}),
+			statusCue: strings.TrimSpace(`
+				{for _, rule in context.outputs.ingress.spec.rules {
+					"host.\(rule.host)": rule.host
+				}}
+			`),
+			expStatus: map[string]string{
+				"host.foo.example.com": "foo.example.com",
+				"host.bar.example.com": "bar.example.com",
+			},
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, status, err := getStatusMap(tc.tpContext, tc.statusCue, tc.parameter)
+			assert.NoError(t, err)
+			assert.Equal(t, tc.expStatus, status)
 		})
 	}
 }
